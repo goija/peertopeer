@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+    <meta charset="UTF-8">
+    <title>P2P PDF Downloader (WebRTC)</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; line-height: 1.6; }
+        .box { border: 2px solid #ddd; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .hidden { display: none; }
+        textarea { width: 100%; height: 100px; margin-bottom: 10px; font-family: monospace; font-size: 12px; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; cursor: pointer; font-size: 1rem; border-radius: 4px; }
+        button:hover { background: #0056b3; }
+        button.secondary { background: #6c757d; }
+        #status { font-weight: bold; color: #28a745; }
+        progress { width: 100%; height: 20px; display: none; }
+    </style>
+</head>
+<body>
+
+    <h1>🚀 WebRTC PDF Overdrager</h1>
+    <p>Stuur PDF's direct van browser naar browser zonder server.</p>
+
+    <div id="step-role" class="box">
+        <h3>Stap 1: Wie ben je?</h3>
+        <button onclick="initSender()">📤 Ik wil een PDF Verzenden</button>
+        <button class="secondary" onclick="initReceiver()">📥 Ik wil Ontvangen</button>
+    </div>
+
+    <div id="ui-sender" class="box hidden">
+        <h3>Verzender Paneel</h3>
+        <input type="file" id="fileInput" accept="application/pdf">
+        <hr>
+        <p>1. Dit is jouw 'Offer' code. Kopieer deze en geef hem aan de ontvanger:</p>
+        <textarea id="sender-offer" readonly placeholder="Wordt gegenereerd..."></textarea>
+        
+        <p>2. Plak hier de 'Answer' code die je van de ontvanger krijgt:</p>
+        <textarea id="sender-answer" placeholder="Plak antwoord hier..."></textarea>
+        <button onclick="senderFinalize()">Verbinden & Versturen</button>
+    </div>
+
+    <div id="ui-receiver" class="box hidden">
+        <h3>Ontvanger Paneel</h3>
+        <p>1. Plak hier de 'Offer' code van de verzender:</p>
+        <textarea id="receiver-offer" placeholder="Plak offer hier..."></textarea>
+        <button onclick="receiverCreateAnswer()">Genereer Antwoord</button>
+        
+        <p>2. Kopieer deze 'Answer' code en geef hem terug aan de verzender:</p>
+        <textarea id="receiver-answer" readonly placeholder="Wordt gegenereerd..."></textarea>
+    </div>
+
+    <div class="box">
+        Status: <span id="status">Wachten op actie...</span>
+        <progress id="progressBar" value="0" max="100"></progress>
+    </div>
+
+<script>
+    const config = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+    const peer = new RTCPeerConnection(config);
+    let dataChannel;
+    
+    // UI Elementen
+    const statusEl = document.getElementById('status');
+    const progressEl = document.getElementById('progressBar');
+
+    // --- LOGICA VOOR VERZENDER ---
+    function initSender() {
+        document.getElementById('step-role').classList.add('hidden');
+        document.getElementById('ui-sender').classList.remove('hidden');
+
+        // Maak datakanaal aan (alleen verzender doet dit)
+        dataChannel = peer.createDataChannel("fileTransfer");
+        setupChannelListeners(dataChannel);
+
+        peer.onicecandidate = e => {
+            if (e.candidate) return; // Wacht tot alle kandidaten verzameld zijn (simpel voor copy-paste)
+            document.getElementById('sender-offer').value = JSON.stringify(peer.localDescription);
+            statusEl.innerText = "Kopieer de Offer-code naar de ontvanger.";
+        };
+
+        peer.createOffer().then(d => peer.setLocalDescription(d));
+    }
+
+    function senderFinalize() {
+        const answer = JSON.parse(document.getElementById('sender-answer').value);
+        peer.setRemoteDescription(answer);
+        statusEl.innerText = "Verbonden! Bestand wordt verstuurd...";
+    }
+
+    // --- LOGICA VOOR ONTVANGER ---
+    function initReceiver() {
+        document.getElementById('step-role').classList.add('hidden');
+        document.getElementById('ui-receiver').classList.remove('hidden');
+
+        peer.ondatachannel = e => {
+            dataChannel = e.channel;
+            setupChannelListeners(dataChannel);
+        };
+
+        peer.onicecandidate = e => {
+            if (e.candidate) return;
+            document.getElementById('receiver-answer').value = JSON.stringify(peer.localDescription);
+            statusEl.innerText = "Kopieer de Antwoord-code terug naar de verzender.";
+        };
+    }
+
+    function receiverCreateAnswer() {
+        const offer = JSON.parse(document.getElementById('receiver-offer').value);
+        peer.setRemoteDescription(offer);
+        peer.createAnswer().then(d => peer.setLocalDescription(d));
+    }
+
+    // --- GEDEELDE LOGICA (BESTANDSOVERDRACHT) ---
+    function setupChannelListeners(channel) {
+        channel.onopen = () => {
+            statusEl.innerText = "Verbinding OPEN! 🟢";
+            if (document.getElementById('ui-sender').classList.contains('hidden') === false) {
+                sendFile();
+            }
+        };
+
+        // Ontvanger logica: Buffer opbouwen
+        let receivedChunks = [];
+        let receivedSize = 0;
+        channel.onmessage = e => {
+            const data = e.data;
+            if (typeof data === 'string' && data.startsWith("META:")) {
+                // Metadata (Bestandsgrootte/Naam) zou hier kunnen, slaan we even over voor simpele demo
+                return; 
+            }
+            if (data === "EOF") {
+                downloadFile(receivedChunks);
+            } else {
+                receivedChunks.push(data);
+                receivedSize += data.byteLength;
+                statusEl.innerText = `Ontvangen: ${(receivedSize / 1024).toFixed(0)} KB`;
+            }
+        };
+    }
+
+    function sendFile() {
+        const fileInput = document.getElementById('fileInput');
+        const file = fileInput.files[0];
+        if (!file) return alert("Selecteer eerst een PDF!");
+
+        statusEl.innerText = `Versturen: ${file.name} (${(file.size/1024).toFixed(0)} KB)`;
+        progressEl.style.display = "block";
+
+        const chunkSize = 16384; // 16KB limiet voor veiligheid
+        const reader = new FileReader();
+        
+        reader.onload = e => {
+            const buffer = e.target.result;
+            let offset = 0;
+
+            const sendLoop = () => {
+                // Buffering controle: stop als buffer vol zit (backpressure)
+                if (dataChannel.bufferedAmount > 16000000) { 
+                    setTimeout(sendLoop, 100);
+                    return;
+                }
+
+                if (offset < buffer.byteLength) {
+                    const chunk = buffer.slice(offset, offset + chunkSize);
+                    dataChannel.send(chunk);
+                    offset += chunkSize;
+                    
+                    // Update progress bar
+                    progressEl.value = (offset / buffer.byteLength) * 100;
+                    
+                    setTimeout(sendLoop, 0); // Laat UI ademen
+                } else {
+                    dataChannel.send("EOF"); // Einde signaal
+                    statusEl.innerText = "Verzenden voltooid! ✅";
+                }
+            };
+            sendLoop();
+        };
+        reader.readAsArrayBuffer(file);
+    }
+
+    function downloadFile(chunks) {
+        const blob = new Blob(chunks, { type: 'application/pdf' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = "gedownload_bestand.pdf";
+        a.click();
+        statusEl.innerText = "Bestand gedownload! 🎉";
+    }
+</script>
+
+</body>
+</html>
